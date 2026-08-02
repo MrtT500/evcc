@@ -29,6 +29,11 @@ PACKAGES = ./release
 GOROOT := $(shell go env GOROOT)
 CURRDIR := $(shell pwd)
 
+raspi: export GOOS = linux
+raspi: export GOARCH = arm
+raspi: export GOARM = 6
+raspi: default
+
 default:: ui build
 
 all:: clean install install-ui ui assets lint test-ui lint-ui test build
