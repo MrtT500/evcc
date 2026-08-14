@@ -93,12 +93,8 @@ func NewCompleoSoloAdvFromConfig(ctx context.Context, other map[string]interface
 	return NewCompleoSoloAdv(ctx, cc.URI, cc.ID)
 }
 
-//go:generate go run ../cmd/tools/decorate.go -f decorateCompleoSolo -b *CompleoSolo -r api.Charger -t "api.Meter,CurrentPower,func() (float64, error)" -t "api.PhaseCurrents,Currents,func() (float64, float64, float64, error)" -t "api.PhaseVoltages,Voltages,func() (float64, float64, float64, error)" -t "api.ChargeRater,ChargedEnergy,func() (float64, error)" -t "api.MeterEnergy,TotalEnergy,func() (float64, error)" -t "api.Identifier,Identify,func() (string, error)"
-
 // NewCompleoSoloAdv creates CompleoSolo charger
 func NewCompleoSoloAdv(ctx context.Context, uri string, id uint8) (api.Charger, error) {
-	fmt.Printf("uri: %s\n", uri)
-
 	conn, err := modbus.NewConnection(ctx, uri, "", "", 0, modbus.Tcp, id)
 	if err != nil {
 		return nil, err
@@ -111,10 +107,11 @@ func NewCompleoSoloAdv(ctx context.Context, uri string, id uint8) (api.Charger, 
 		log:       log,
 		conn:      conn,
 		_maxPower: 110,
-		_timeout:  30,
+		// 120s überbrückt die periodischen Netzwerkausfälle der Box (~45s),
+		// stoppt die Ladung aber weiterhin, falls evcc komplett ausfällt
+		_timeout: 120,
 	}
 
-	// timeout 30 Sekunden
 	wb.conn.WriteSingleRegister(compleoAdvRegTimeout, wb._timeout)
 	// configure to 11kW
 	wb.conn.WriteSingleRegister(compleoAdvRegMaxPower, wb._maxPower)
@@ -122,10 +119,36 @@ func NewCompleoSoloAdv(ctx context.Context, uri string, id uint8) (api.Charger, 
 	// 100%
 	wb.conn.WriteSingleRegister(compleoAdvRegPowerPercentage, 100)
 	wb.conn.WriteSingleRegister(compleoAdvRegPowerPercentageFallback, 0) // OFF without control!
-	// 20 A unbalanced
-	wb.conn.WriteSingleRegister(compleoAdvRegMaxUnbalancedLoad, 2000)
+	// Schieflast verwaltet die Box selbst (11-kW-Box: max. 16,0 A = Registerwert 160);
+	// der frühere Write von 2000 wurde von der Box verworfen
+
+	// heartbeat am tatsächlich in der Box aktiven Timeout ausrichten,
+	// falls der Schreibzugriff oben nicht angekommen ist
+	b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegTimeout, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failsafe timeout: %w", err)
+	}
+	if u := binary.BigEndian.Uint16(b); u > 0 {
+		go wb.heartbeat(ctx, time.Duration(u)*time.Second/2)
+	}
 
 	return wb, err
+}
+
+// heartbeat hält den Kommunikations-Watchdog der Box unabhängig vom
+// evcc-Poll-Intervall am Leben; jede Modbus-Transaktion setzt ihn zurück
+func (wb *CompleoSoloAdv) heartbeat(ctx context.Context, timeout time.Duration) {
+	for tick := time.Tick(timeout); ; {
+		select {
+		case <-tick:
+		case <-ctx.Done():
+			return
+		}
+
+		if _, err := wb.conn.ReadInputRegisters(compleoAdvRegCPStatus, 1); err != nil {
+			wb.log.ERROR.Println("heartbeat:", err)
+		}
+	}
 }
 
 // Status implements the api.Charger interface
@@ -136,95 +159,73 @@ func (wb *CompleoSoloAdv) Status() (api.ChargeStatus, error) {
 	}
 
 	s := binary.BigEndian.Uint16(b)
-	wb.log.TRACE.Printf("compleoAdvRegCPStatus: %d\n", s)
+	wb.log.TRACE.Printf("compleoAdvRegCPStatus: %d", s)
 
-	switch s {
-	case 0:
-		return api.StatusA, nil
-	case 3:
-		return api.StatusC, nil
-	case 5, 7:
-		return api.StatusB, nil
-	default:
-		return api.StatusNone, fmt.Errorf("invalid status: %d\n", s)
+	// Bitfeld: Bit 0=Aktiv, 1=Lädt, 2=Begrenzt, 3=Fehler, 4/5=Bevorzugter Ladepunkt
+	if s&8 != 0 {
+		return api.StatusNone, fmt.Errorf("status error bit set: %d", s)
 	}
+
+	res := api.StatusA
+	if s&1 != 0 {
+		res = api.StatusB
+	}
+	if s&2 != 0 {
+		res = api.StatusC
+	}
+
+	return res, nil
 }
 
 // Enabled implements the api.Charger interface
 func (wb *CompleoSoloAdv) Enabled() (bool, error) {
-	//	fmt.Print("Enabled")
-
-	// this is NOT in the documentation - there Holding-type is documented
-	b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegPowerPercentage, 2)
+	// die Box rechnet den Prozentwert selbst um (z.B. 100 -> 99),
+	// daher nur auf 0 / nicht 0 prüfen
+	b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegPowerPercentage, 1)
 	if err != nil {
-
-		return false, fmt.Errorf("Enabled Error Writing reg err=%s\n", err.Error())
+		return false, err
 	}
-	var percent uint16 = binary.BigEndian.Uint16(b)
-	wb.log.TRACE.Printf("Enabled read: %d %d %d", percent, b[0], b[1])
-	return percent != 0, nil
+
+	return binary.BigEndian.Uint16(b) != 0, nil
 }
 
 // Enable implements the api.Charger interface
 func (wb *CompleoSoloAdv) Enable(enable bool) error {
-	wb.log.TRACE.Printf("Enable: %t\n", enable)
+	wb.log.TRACE.Printf("Enable: %t", enable)
 
 	var percent uint16
 	if enable {
 		percent = 100
-	} else {
-		percent = 0
 	}
 
 	_, err := wb.conn.WriteSingleRegister(compleoAdvRegPowerPercentage, percent)
-
-	if err != nil {
-		return fmt.Errorf("Error Writing compleoAdvRegPowerPercentage: %d\n", percent)
-	}
-
 	return err
 }
 
 // MaxCurrent implements the api.Charger interface
 func (wb *CompleoSoloAdv) MaxCurrent(current int64) error {
-	wb.log.TRACE.Printf("MaxCurrent: %d\n", current)
-
-	//	var percent uint16
-	//	percent = uint16(float64(current) * 100 / 16)
-	//	_, err := wb.conn.WriteSingleRegister(compleoAdvRegPowerPercentage, percent)
-	var regval uint16
-	regval = uint16(float64(current)*110.0/16.0) + 1
+	regval := uint16(float64(current)*110.0/16.0) + 1
 	regval = uint16(math.Min(110, float64(regval)))
+
+	wb.log.TRACE.Printf("MaxCurrent %d A -> compleoAdvRegCPMaxPower %d", current, regval)
+
 	_, err := wb.conn.WriteSingleRegister(compleoAdvRegCPMaxPower, regval)
-
-	if err != nil {
-		return fmt.Errorf("MaxCurrent Write Error err=%s\n", err.Error())
-	} else {
-		wb.log.TRACE.Printf("Wrote reg compleoAdvRegCPMaxPower : %d\n", regval)
-	}
-
-	return nil
+	return err
 }
 
 var _ api.ChargeTimer = (*CompleoSoloAdv)(nil)
 
 // ChargingTime implements the api.ChargeTimer interface
 func (wb *CompleoSoloAdv) ChargeDuration() (time.Duration, error) {
-	wb.log.TRACE.Println("ChargingTime")
-	var sec uint32
-
 	b, err := wb.conn.ReadInputRegisters(compleoAdvRegCPChargingTime0, 2)
 	if err != nil {
 		return 0, err
 	}
-	sec = uint32(binary.BigEndian.Uint16(b))
-	b, err = wb.conn.ReadInputRegisters(compleoAdvRegCPChargingTime1, 2)
-	if err != nil {
-		return 0, err
-	}
-	sec = sec + (uint32(binary.BigEndian.Uint16(b)) << 16)
 
-	wb.log.DEBUG.Printf("ChargingTime: %d seconds\n", sec)
+	// Sekunden, LSW first
+	sec := uint32(binary.BigEndian.Uint16(b)) | uint32(binary.BigEndian.Uint16(b[2:]))<<16
+
+	wb.log.DEBUG.Printf("ChargingTime: %d seconds", sec)
 	return time.Duration(sec) * time.Second, nil
 }
 
@@ -232,21 +233,7 @@ var _ api.Meter = (*CompleoSoloAdv)(nil)
 
 // CurrentPower implements the api.Meter interface
 func (wb *CompleoSoloAdv) CurrentPower() (float64, error) {
-	b, err := wb.conn.ReadInputRegisters(compleoAdvRegCPPower, 2)
-	if err != nil {
-		return 0, fmt.Errorf("Error Reading compleoAdvRegCPPower err=%s\n", err.Error())
-	}
-	var val uint16
-	val = binary.BigEndian.Uint16(b)
-	val *= 100
-
-	wb.log.TRACE.Printf("Reading compleoAdvRegCPPower: %d\n", val)
-	return float64(val), nil
-}
-
-// ChargedEnergy implements the api.ChargeRater interface
-func (wb *CompleoSoloAdv) chargedEnergy() (float64, error) {
-	b, err := wb.conn.ReadInputRegisters(compleoAdvRegCPChargedEnergy, 2)
+	b, err := wb.conn.ReadInputRegisters(compleoAdvRegCPPower, 1)
 	if err != nil {
 		return 0, err
 	}
@@ -254,100 +241,91 @@ func (wb *CompleoSoloAdv) chargedEnergy() (float64, error) {
 	return float64(binary.BigEndian.Uint16(b)) * 100, nil
 }
 
-// TotalEnergy implements the api.MeterEnergy interface
-func (wb *CompleoSoloAdv) totalEnergy() (float64, error) {
+var _ api.ChargeRater = (*CompleoSoloAdv)(nil)
 
-	return wb.chargedEnergy()
+// ChargedEnergy implements the api.ChargeRater interface
+func (wb *CompleoSoloAdv) ChargedEnergy() (float64, error) {
+	b, err := wb.conn.ReadInputRegisters(compleoAdvRegCPChargedEnergy, 1)
+	if err != nil {
+		return 0, err
+	}
+
+	// 100Wh-Schritte -> kWh
+	return float64(binary.BigEndian.Uint16(b)) / 10, nil
 }
 
-// currents implements the api.PhaseCurrents interface
-func (wb *CompleoSoloAdv) currents() (float64, float64, float64, error) {
+var _ api.PhaseCurrents = (*CompleoSoloAdv)(nil)
+
+// Currents implements the api.PhaseCurrents interface
+func (wb *CompleoSoloAdv) Currents() (float64, float64, float64, error) {
+	b, err := wb.conn.ReadInputRegisters(compleoAdvRegCurrentPhase1, 3)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
 	var curr [3]float64
-	b, err := wb.conn.ReadInputRegisters(compleoAdvRegCurrentPhase1, 2)
-	if err != nil {
-		return 0, 0, 0, err
+	for i := range curr {
+		curr[i] = float64(binary.BigEndian.Uint16(b[2*i:])) / 10
 	}
-	curr[0] = float64(binary.BigEndian.Uint16(b)) * 0.1
-
-	b, err = wb.conn.ReadInputRegisters(compleoAdvRegCurrentPhase2, 2)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	curr[1] = float64(binary.BigEndian.Uint16(b)) * 0.1
-
-	b, err = wb.conn.ReadInputRegisters(compleoAdvRegCurrentPhase3, 2)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	curr[2] = float64(binary.BigEndian.Uint16(b)) * 0.1
 
 	return curr[0], curr[1], curr[2], nil
 }
 
-// voltages implements the api.PhaseVoltages interface
-func (wb *CompleoSoloAdv) voltages() (float64, float64, float64, error) {
-
-	return 230.0, 230.0, 230.0, nil
-}
-
-// identify implements the api.Identifier interface
-func (wb *CompleoSoloAdv) identify() (string, error) {
-
-	return "CompleoID", nil
-}
-
 var _ api.Diagnosis = (*CompleoSoloAdv)(nil)
+
+// diagnoseReg reads a single register and prints value or error
+func (wb *CompleoSoloAdv) diagnoseReg(label string, holding bool, addr uint16, format func(uint16) string) {
+	var b []byte
+	var err error
+	if holding {
+		b, err = wb.conn.ReadHoldingRegisters(addr, 1)
+	} else {
+		b, err = wb.conn.ReadInputRegisters(addr, 1)
+	}
+
+	if err != nil {
+		fmt.Printf("\t%s:\terror: %v\n", label, err)
+		return
+	}
+
+	fmt.Printf("\t%s:\t%s\n", label, format(binary.BigEndian.Uint16(b)))
+}
 
 // Diagnose implements the api.Diagnosis interface
 func (wb *CompleoSoloAdv) Diagnose() {
+	watt := func(v uint16) string { return fmt.Sprintf("%d W", 100*uint32(v)) }
+	percent := func(v uint16) string { return fmt.Sprintf("%d %%", v) }
+	ampere := func(v uint16) string { return fmt.Sprintf("%.1f A", float64(v)/10) }
+	plain := func(v uint16) string { return fmt.Sprintf("%d", v) }
+
 	fmt.Printf("\tModel:\tCompleo Solo SAM Advanced\n")
 
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegNumberOfChargePoints, 2); err == nil {
-		fmt.Printf("\tChargepoints:\t%d\n", binary.BigEndian.Uint16(b))
-	}
+	wb.diagnoseReg("Chargepoints", false, compleoAdvRegNumberOfChargePoints, plain)
 
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegFirmwareVersion0, 4); err == nil {
+	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegFirmwareVersion0, 2); err == nil {
 		fmt.Printf("\tFirmware:\t%d.%d.%d\n", b[2], b[3], b[0])
+	} else {
+		fmt.Printf("\tFirmware:\terror: %v\n", err)
 	}
 
-	if b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegMaxPower, 2); err == nil {
-		fmt.Printf("\tMax Power:\t%d W\n", 100*binary.BigEndian.Uint16(b))
-	}
-
-	if b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegPowerPercentage, 2); err == nil {
-		fmt.Printf("\tMax Powerpercentage:\t%d %%\n", binary.BigEndian.Uint16(b))
-	}
-
-	if b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegMaxUnbalancedLoad, 2); err == nil {
-		fmt.Printf("\tMax MaxUnbalanced:%d \t%f \n", binary.BigEndian.Uint16(b), float64(binary.BigEndian.Uint16(b))*0.1)
-	}
-
-	if b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegMaxPowerFallback, 2); err == nil {
-		fmt.Printf("\tMax PowerFB:\t%d W\n", 100*binary.BigEndian.Uint16(b))
-	}
-
-	if b, err := wb.conn.ReadHoldingRegisters(compleoAdvRegPowerPercentageFallback, 2); err == nil {
-		fmt.Printf("\tMax PowerpercentageFB:\t%d %% \n", binary.BigEndian.Uint16(b))
-	}
-
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegPower, 2); err == nil {
-		fmt.Printf("\tCurr Power:\t%d W\n", 100*binary.BigEndian.Uint16(b))
-	}
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegCurrentPhase1, 2); err == nil {
-		fmt.Printf("\tAct. Current P1:\t%f A\n", 0.1*float64(binary.BigEndian.Uint16(b)))
-	}
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegCurrentPhase2, 2); err == nil {
-		fmt.Printf("\tAct. Current P2:\t%f A\n", 0.1*float64(binary.BigEndian.Uint16(b)))
-	}
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegCurrentPhase3, 2); err == nil {
-		fmt.Printf("\tAct. Current P3:\t%f A\n", 0.1*float64(binary.BigEndian.Uint16(b)))
-	}
-
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegUnusedPower, 2); err == nil {
-		fmt.Printf("\tUnused Power:\t%d W\n", 100*binary.BigEndian.Uint16(b))
-	}
-
-	if b, err := wb.conn.ReadInputRegisters(compleoAdvRegCPStatus, 2); err == nil {
-		fmt.Printf("\tcompleoAdvRegCPStatus:\t%d W\n", binary.BigEndian.Uint16(b))
-	}
+	wb.diagnoseReg("Max Power", true, compleoAdvRegMaxPower, watt)
+	wb.diagnoseReg("Power Percentage", true, compleoAdvRegPowerPercentage, percent)
+	wb.diagnoseReg("Max Unbalanced Load", true, compleoAdvRegMaxUnbalancedLoad, ampere)
+	wb.diagnoseReg("Max Power Fallback", true, compleoAdvRegMaxPowerFallback, watt)
+	wb.diagnoseReg("Power Percentage Fallback", true, compleoAdvRegPowerPercentageFallback, percent)
+	wb.diagnoseReg("Timeout", true, compleoAdvRegTimeout, func(v uint16) string {
+		return fmt.Sprintf("%d s (Fallback nach %d s)", v, 2*uint32(v))
+	})
+	wb.diagnoseReg("Current Power", false, compleoAdvRegPower, watt)
+	wb.diagnoseReg("Current P1", false, compleoAdvRegCurrentPhase1, ampere)
+	wb.diagnoseReg("Current P2", false, compleoAdvRegCurrentPhase2, ampere)
+	wb.diagnoseReg("Current P3", false, compleoAdvRegCurrentPhase3, ampere)
+	wb.diagnoseReg("Unused Power", false, compleoAdvRegUnusedPower, watt)
+	wb.diagnoseReg("CP Max Power", true, compleoAdvRegCPMaxPower, watt)
+	wb.diagnoseReg("CP Status", false, compleoAdvRegCPStatus, func(v uint16) string {
+		return fmt.Sprintf("%d (Bits: %04b)", v, v)
+	})
+	wb.diagnoseReg("CP Charged Energy", false, compleoAdvRegCPChargedEnergy, func(v uint16) string {
+		return fmt.Sprintf("%.1f kWh", float64(v)/10)
+	})
 }
